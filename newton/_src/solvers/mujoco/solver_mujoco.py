@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -24,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import warp as wp
 
-from ...core.types import MAXVAL, nparray, override, vec5, vec10
+from ...core.types import MAXVAL, override, vec5, vec10
 from ...geometry import GeoType, ShapeFlags
 from ...sim import (
     BodyFlags,
@@ -48,13 +36,14 @@ from .kernels import (
     apply_mjc_control_kernel,
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
+    build_ref_q_kernel,
     convert_mj_coords_to_warp_kernel,
-    convert_mjw_contacts_to_newton_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
     convert_rigid_forces_from_mj_kernel,
     convert_solref,
     convert_warp_coords_to_mj_kernel,
+    create_convert_mjw_contacts_to_newton_kernel,
     create_inverse_shape_mapping_kernel,
     eval_articulation_fk,
     repeat_array_kernel,
@@ -63,6 +52,8 @@ from .kernels import (
     update_body_inertia_kernel,
     update_body_mass_ipos_kernel,
     update_body_properties_kernel,
+    update_connect_constraint_anchors_kernel,
+    update_connect_constraint_rel_body_poses_at_qref_kernel,
     update_ctrl_direct_actuator_properties_kernel,
     update_dof_properties_kernel,
     update_eq_data_and_active_kernel,
@@ -180,10 +171,10 @@ class SolverMuJoCo(SolverBase):
         For :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET` mode, determines which target array to read from:
 
         - :attr:`POSITION`: Maps from :attr:`~newton.Control.joint_target_pos`, syncs gains from
-          :attr:`~newton.Control.joint_target_ke`. For :attr:`~newton.JointTargetMode.POSITION`-only actuators,
-          also syncs damping from :attr:`~newton.Control.joint_target_kd`. For
+          :attr:`~newton.Model.joint_target_ke`. For :attr:`~newton.JointTargetMode.POSITION`-only actuators,
+          also syncs damping from :attr:`~newton.Model.joint_target_kd`. For
           :attr:`~newton.JointTargetMode.POSITION_VELOCITY` mode, kd is handled by the separate velocity actuator.
-        - :attr:`VELOCITY`: Maps from :attr:`~newton.Control.joint_target_vel`, syncs gains from :attr:`~newton.Control.joint_target_kd`
+        - :attr:`VELOCITY`: Maps from :attr:`~newton.Control.joint_target_vel`, syncs gains from :attr:`~newton.Model.joint_target_kd`
         - :attr:`GENERAL`: Used with :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.CTRL_DIRECT` mode for motor/general actuators
         """
 
@@ -206,6 +197,7 @@ class SolverMuJoCo(SolverBase):
     # Class variables to cache the imported modules
     _mujoco = None
     _mujoco_warp = None
+    _convert_mjw_contacts_to_newton_kernel = None
 
     @classmethod
     def import_mujoco(cls):
@@ -407,8 +399,8 @@ class SolverMuJoCo(SolverBase):
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
         """
         Declare custom attributes to be allocated on the Model object within the ``mujoco`` namespace.
-        Note that we declare all custom attributes with the :attr:`newton.ModelBuilder.CustomAttribute.usd_attribute_name` set to ``"mjc"`` here to leverage the MuJoCo USD schema
-        where attributes are named ``"mjc:attr"`` rather than ``"newton:mujoco:attr"``.
+        Custom attributes use ``CustomAttribute.usd_attribute_name`` with the ``mjc:`` prefix (e.g. ``"mjc:condim"``)
+        to leverage the MuJoCo USD schema where attributes are named ``"mjc:attr"`` rather than ``"newton:mujoco:attr"``.
         """
         # Register custom frequencies before adding attributes that use them
         # This is required as custom frequencies must be registered before use
@@ -2836,34 +2828,38 @@ class SolverMuJoCo(SolverBase):
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
 
+        # Deferred from module scope: wp.static() in this kernel imports mujoco_warp.
+        if SolverMuJoCo._convert_mjw_contacts_to_newton_kernel is None:
+            SolverMuJoCo._convert_mjw_contacts_to_newton_kernel = create_convert_mjw_contacts_to_newton_kernel()
+
         # --- New unified mappings: MuJoCo[world, entity] -> Newton[entity] ---
-        self.mjc_body_to_newton: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_body_to_newton: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, body] to Newton body index. Shape [nworld, nbody], dtype int32."""
-        self.mjc_geom_to_newton_shape: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
-        self.mjc_jnt_to_newton_jnt: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_jnt_to_newton_jnt: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, joint] to Newton joint index. Shape [nworld, njnt], dtype int32."""
-        self.mjc_jnt_to_newton_dof: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_jnt_to_newton_dof: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, joint] to Newton DOF index. Shape [nworld, njnt], dtype int32."""
-        self.mjc_dof_to_newton_dof: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_dof_to_newton_dof: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, dof] to Newton DOF index. Shape [nworld, nv], dtype int32."""
-        self.newton_dof_to_body: wp.array(dtype=wp.int32) | None = None
+        self.newton_dof_to_body: wp.array[wp.int32] | None = None
         """Mapping from Newton DOF index to child body index. Shape [joint_dof_count], dtype int32."""
-        self.mjc_mocap_to_newton_jnt: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_mocap_to_newton_jnt: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, mocap] to Newton joint index. Shape [nworld, nmocap], dtype int32."""
-        self.mjc_actuator_ctrl_source: wp.array(dtype=wp.int32) | None = None
+        self.mjc_actuator_ctrl_source: wp.array[wp.int32] | None = None
         """Control source for each MuJoCo actuator.
 
         Values: 0=JOINT_TARGET (uses joint_target_pos/vel), 1=CTRL_DIRECT (uses mujoco.ctrl)
         Shape [nu], dtype int32."""
-        self.mjc_actuator_to_newton_idx: wp.array(dtype=wp.int32) | None = None
+        self.mjc_actuator_to_newton_idx: wp.array[wp.int32] | None = None
         """Mapping from MuJoCo actuator to Newton index.
 
         For JOINT_TARGET: sign-encoded DOF index (>=0: position, -1: unmapped, <=-2: velocity with -(idx+2))
         For CTRL_DIRECT: MJCF-order index into control.mujoco.ctrl array
 
         Shape [nu], dtype int32."""
-        self.mjc_eq_to_newton_eq: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_eq_to_newton_eq: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton equality constraint index.
 
         Corresponds to the equality constraints that are created in MuJoCo from Newton's equality constraints.
@@ -2871,7 +2867,7 @@ class SolverMuJoCo(SolverBase):
         for the corresponding joint index.
 
         Shape [nworld, neq], dtype int32."""
-        self.mjc_eq_to_newton_jnt: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_eq_to_newton_jnt: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton joint index.
 
         Corresponds to the equality constraints that are created in MuJoCo from Newton joints that have no associated articulation,
@@ -2880,22 +2876,22 @@ class SolverMuJoCo(SolverBase):
         see :attr:`mjc_eq_to_newton_eq` for the corresponding equality constraint index.
 
         Shape [nworld, neq], dtype int32."""
-        self.mjc_eq_to_newton_mimic: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_eq_to_newton_mimic: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, eq] to Newton mimic constraint index.
 
         Corresponds to the equality constraints that are created in MuJoCo from Newton's mimic constraints.
         A value of -1 indicates that the MuJoCo equality constraint is not associated with a Newton mimic constraint.
 
         Shape [nworld, neq], dtype int32."""
-        self.mjc_tendon_to_newton_tendon: wp.array(dtype=wp.int32, ndim=2) | None = None
+        self.mjc_tendon_to_newton_tendon: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, tendon] to Newton tendon index.
 
         Shape [nworld, ntendon], dtype int32."""
-        self.body_free_qd_start: wp.array(dtype=wp.int32) | None = None
+        self.body_free_qd_start: wp.array[wp.int32] | None = None
         """Per-body mapping to the free-joint qd_start index (or -1 if not free)."""
 
         # --- Conditional/lazy mappings ---
-        self.newton_shape_to_mjc_geom: wp.array(dtype=wp.int32) | None = None
+        self.newton_shape_to_mjc_geom: wp.array[wp.int32] | None = None
         """Inverse mapping from Newton shape index to MuJoCo geom index. Only created when use_mujoco_contacts=False. Shape [nshape], dtype int32."""
 
         # --- Helper arrays for actuator types ---
@@ -2905,6 +2901,14 @@ class SolverMuJoCo(SolverBase):
         """Number of shapes per world (for computing Newton shape indices from template)."""
         self._first_env_shape_base: int = 0
         """Base shape index for the first environment."""
+
+        # --- Internal state for connect constraint anchor computation ---
+        self.has_connect_constraints: bool = False
+        """Whether the model contains any CONNECT equality constraints."""
+        self.connect_constraint_q_rel: wp.array | None = None
+        """Relative rotation ``inv(q2) * q1`` at the reference pose per equality constraint, ``wp.array[wp.quat]``, shape ``[equality_constraint_count]``."""
+        self.connect_constraint_t_rel: wp.array | None = None
+        """Relative translation [m] at the reference pose per equality constraint, ``wp.array[wp.vec3]``, shape ``[equality_constraint_count]``."""
 
         self._viewer = None
         """Instance of the MuJoCo viewer for debugging."""
@@ -3000,6 +3004,10 @@ class SolverMuJoCo(SolverBase):
         if self.newton_shape_to_mjc_geom is None:
             self._create_inverse_shape_mapping()
 
+        # Zero nacon before the kernel — the kernel uses atomic_add to count
+        # only the contacts that survive immovable-pair filtering.
+        self.mjw_data.nacon.zero_()
+
         bodies_per_world = self.model.body_count // self.model.world_count
         wp.launch(
             convert_newton_contacts_to_mjwarp_kernel,
@@ -3007,6 +3015,9 @@ class SolverMuJoCo(SolverBase):
             inputs=[
                 state_in.body_q,
                 model.shape_body,
+                model.body_flags,
+                self.mjw_model.geom_bodyid,
+                self.mjw_model.body_weldid,
                 self.mjw_model.geom_condim,
                 self.mjw_model.geom_priority,
                 self.mjw_model.geom_solmix,
@@ -3088,6 +3099,13 @@ class SolverMuJoCo(SolverBase):
             need_const_0 = True
             need_length_range = True
 
+        update_connect_constraint_anchor_rel_xform_at_ref_pose = self.has_connect_constraints and bool(
+            flags & (SolverNotifyFlags.JOINT_PROPERTIES | SolverNotifyFlags.JOINT_DOF_PROPERTIES)
+        )
+        update_connect_constraint_anchors = self.has_connect_constraints and bool(
+            flags & SolverNotifyFlags.CONSTRAINT_PROPERTIES
+        )
+
         if self.use_mujoco_cpu:
             if flags & (SolverNotifyFlags.BODY_PROPERTIES | SolverNotifyFlags.JOINT_DOF_PROPERTIES):
                 self.mj_model.dof_armature[:] = self.mjw_model.dof_armature.numpy()[0]
@@ -3097,11 +3115,24 @@ class SolverMuJoCo(SolverBase):
                 self.mj_model.dof_solref[:] = self.mjw_model.dof_solref.numpy()[0]
                 self.mj_model.qpos0[:] = self.mjw_model.qpos0.numpy()[0]
                 self.mj_model.qpos_spring[:] = self.mjw_model.qpos_spring.numpy()[0]
-
             if need_length_range or need_const_fixed or need_const_0:
                 self._mujoco.mj_setConst(self.mj_model, self.mj_data)
+            # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
+            # without accounting for Newton's dof_ref, so we overwrite with the
+            # correctly computed values.
+            self._notify_connect_constraints_changed(
+                update_connect_constraint_anchor_rel_xform_at_ref_pose,
+                update_connect_constraint_anchors,
+            )
+
         else:
-            if need_length_range or need_const_fixed or need_const_0:
+            if (
+                need_length_range
+                or need_const_fixed
+                or need_const_0
+                or update_connect_constraint_anchor_rel_xform_at_ref_pose
+                or update_connect_constraint_anchors
+            ):
                 with wp.ScopedDevice(self.model.device):
                     if need_length_range:
                         self._mujoco_warp.set_length_range(self.mjw_model, self.mjw_data)
@@ -3109,6 +3140,13 @@ class SolverMuJoCo(SolverBase):
                         self._mujoco_warp.set_const_fixed(self.mjw_model, self.mjw_data)
                     if need_const_0:
                         self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+                    # Must be called last — mj_setConst/set_const_0 computes CONNECT anchor2
+                    # without accounting for Newton's dof_ref, so we overwrite with the
+                    # correctly computed values.
+                    self._notify_connect_constraints_changed(
+                        update_connect_constraint_anchor_rel_xform_at_ref_pose,
+                        update_connect_constraint_anchors,
+                    )
 
     def _create_inverse_shape_mapping(self):
         """
@@ -3442,8 +3480,8 @@ class SolverMuJoCo(SolverBase):
     @staticmethod
     def _find_body_collision_filter_pairs(
         model: Model,
-        selected_bodies: nparray,
-        colliding_shapes: nparray,
+        selected_bodies: np.ndarray,
+        colliding_shapes: np.ndarray,
     ):
         """For shape collision filter pairs, find body collision filter pairs that are contained within."""
 
@@ -3477,8 +3515,8 @@ class SolverMuJoCo(SolverBase):
 
     @staticmethod
     def _color_collision_shapes(
-        model: Model, selected_shapes: nparray, visualize_graph: bool = False, shape_labels: list[str] | None = None
-    ) -> nparray:
+        model: Model, selected_shapes: np.ndarray, visualize_graph: bool = False, shape_labels: list[str] | None = None
+    ) -> np.ndarray:
         """
         Find a graph coloring of the collision filter pairs in the model.
         Shapes within the same color cannot collide with each other.
@@ -3491,7 +3529,7 @@ class SolverMuJoCo(SolverBase):
             shape_labels: The labels of the shapes, only used for visualization.
 
         Returns:
-            nparray: An integer array of shape (num_shapes,), where each element is the color of the corresponding shape.
+            np.ndarray: An integer array of shape (num_shapes,), where each element is the color of the corresponding shape.
         """
         # we first create a mapping from selected shape to local color shape index
         # to reduce the number of nodes in the graph to only the number of selected shapes
@@ -3560,19 +3598,25 @@ class SolverMuJoCo(SolverBase):
             )
 
         wp.launch(
-            convert_mjw_contacts_to_newton_kernel,
+            self._convert_mjw_contacts_to_newton_kernel,
             dim=mj_data.naconmax,
             inputs=[
                 self.mjc_geom_to_newton_shape,
-                self.mjc_body_to_newton,
-                self.mjw_model.opt.cone == int(self._mujoco.mjtCone.mjCONE_PYRAMIDAL),
+                self.mjw_model.opt.cone,
                 mj_data.nacon,
+                mj_contact.pos,
                 mj_contact.frame,
+                mj_contact.friction,
+                mj_contact.dist,
                 mj_contact.dim,
                 mj_contact.geom,
                 mj_contact.efc_address,
                 mj_contact.worldid,
                 mj_data.efc.force,
+                self.mjw_model.geom_bodyid,
+                mj_data.xpos,
+                mj_data.xquat,
+                mj_data.njmax,
             ],
             outputs=[
                 contacts.rigid_contact_count,
@@ -3718,7 +3762,7 @@ class SolverMuJoCo(SolverBase):
             # For Warp kernel equivalent, see quat_wxyz_to_xyzw() in kernels.py
             return [q[1], q[2], q[3], q[0]]
 
-        def fill_arr_from_dict(arr: nparray, d: dict[int, Any]):
+        def fill_arr_from_dict(arr: np.ndarray, d: dict[int, Any]):
             # fast way to fill an array from a dictionary
             # keys and values can also be tuples of integers
             keys = np.array(list(d.keys()), dtype=int)
@@ -3897,7 +3941,7 @@ class SolverMuJoCo(SolverBase):
         # retrieve MuJoCo-specific attributes
         mujoco_attrs = getattr(model, "mujoco", None)
 
-        def get_custom_attribute(name: str) -> nparray | None:
+        def get_custom_attribute(name: str) -> np.ndarray | None:
             if mujoco_attrs is None:
                 return None
             attr = getattr(mujoco_attrs, name, None)
@@ -4679,6 +4723,7 @@ class SolverMuJoCo(SolverBase):
         for i in selected_constraints:
             constraint_type = eq_constraint_type[i]
             if constraint_type == EqType.CONNECT:
+                self.has_connect_constraints = True
                 eq = spec.add_equality(objtype=mujoco.mjtObj.mjOBJ_BODY)
                 eq.type = mujoco.mjtEq.mjEQ_CONNECT
                 eq.active = eq_constraint_enabled[i]
@@ -5688,6 +5733,255 @@ class SolverMuJoCo(SolverBase):
                 device=self.model.device,
             )
 
+    @staticmethod
+    def _copy_dof_ref_to_qref(model: Model) -> wp.array:
+        """Build reference joint coordinates from model data and ``dof_ref``.
+
+        Launches ``build_ref_q_kernel`` to produce joint coordinates in
+        Newton convention (xyzw quaternions). FREE/DISTANCE joints source
+        position and orientation from ``body_q`` of the child body, BALL
+        joints use identity, and hinge/slide/D6 joints use ``dof_ref``.
+
+        Args:
+            model: The Newton :class:`Model`.
+
+        Returns:
+            Reference joint coordinates [m or rad],
+            ``wp.array[wp.float32]``, shape ``[joint_coord_count]``.
+        """
+        mujoco_attrs = getattr(model, "mujoco", None)
+        dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
+
+        ref_q = wp.zeros(model.joint_coord_count, dtype=wp.float32, device=model.device)
+        wp.launch(
+            kernel=build_ref_q_kernel,
+            dim=model.joint_count,
+            inputs=[
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                model.joint_child,
+                model.body_q,
+                dof_ref,
+            ],
+            outputs=[
+                ref_q,
+            ],
+            device=model.device,
+        )
+        return ref_q
+
+    @staticmethod
+    def _compute_body_poses_at_qref(model: Model, ref_q: wp.array) -> wp.array:
+        """Compute body transforms at the reference joint configuration.
+
+        Runs ``eval_articulation_fk`` with the given ``ref_q`` and zero
+        velocities to obtain world-space body transforms at the reference
+        pose.
+
+        Args:
+            model: The Newton :class:`Model`.
+            ref_q: Reference joint coordinates [m or rad],
+                ``wp.array[wp.float32]``, shape ``[joint_coord_count]``.
+
+        Returns:
+            Body transforms at the reference pose [m],
+            ``wp.array[wp.transform]``, shape ``[body_count]``.
+        """
+        ref_qd = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
+
+        ref_body_q = wp.zeros(model.body_count, dtype=wp.transform, device=model.device)
+        ref_body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
+
+        wp.launch(
+            kernel=eval_articulation_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_articulation,
+                ref_q,
+                ref_qd,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_dof_dim,
+                model.body_com,
+            ],
+            outputs=[
+                ref_body_q,
+                ref_body_qd,
+            ],
+            device=model.device,
+        )
+        return ref_body_q
+
+    @staticmethod
+    def _compute_connect_constraint_rel_xform_at_qref(model: Model, ref_body_q: wp.array) -> tuple[wp.array, wp.array]:
+        """Compute relative body transforms for CONNECT constraints at the reference pose.
+
+        Launches ``update_connect_constraint_rel_body_poses_at_qref_kernel``
+        to compute per-constraint ``(q_rel, t_rel)`` pairs such that::
+
+            anchor2 = quat_rotate(q_rel, anchor1) + t_rel
+
+        Args:
+            model: The Newton :class:`Model`.
+            ref_body_q: Body transforms at the reference pose [m],
+                ``wp.array[wp.transform]``, shape ``[body_count]``.
+
+        Returns:
+            Tuple of ``(q_rel, t_rel)`` where ``q_rel`` is
+            ``wp.array[wp.quat]`` and ``t_rel`` is
+            ``wp.array[wp.vec3]`` [m], each of
+            shape ``[equality_constraint_count]``.
+        """
+        neq = model.equality_constraint_count
+
+        q_rel = wp.zeros(neq, dtype=wp.quat, device=model.device)
+        t_rel = wp.zeros(neq, dtype=wp.vec3, device=model.device)
+
+        wp.launch(
+            update_connect_constraint_rel_body_poses_at_qref_kernel,
+            dim=neq,
+            inputs=[
+                model.equality_constraint_type,
+                model.equality_constraint_body1,
+                model.equality_constraint_body2,
+                ref_body_q,
+            ],
+            outputs=[
+                q_rel,
+                t_rel,
+            ],
+            device=model.device,
+        )
+
+        return q_rel, t_rel
+
+    @staticmethod
+    def _update_connect_constraint_anchor_rel_xform_at_ref_pose(
+        model: Model,
+    ) -> tuple[wp.array, wp.array]:
+        """Per-CONNECT constraint, recompute relative transforms from scratch via FK at the reference pose.
+
+        High-level orchestrator that calls ``_copy_dof_ref_to_qref``,
+        ``_compute_body_poses_at_qref``, and
+        ``_compute_connect_constraint_rel_xform_at_qref`` in sequence to
+        produce the per-constraint ``(q_rel, t_rel)`` that map ``anchor1``
+        to ``anchor2``.
+
+        Args:
+            model: The Newton :class:`Model`.
+
+        Returns:
+            Tuple of ``(q_rel, t_rel)`` where ``q_rel`` is
+            ``wp.array[wp.quat]`` and ``t_rel`` is
+            ``wp.array[wp.vec3]`` [m], each of
+            shape ``[equality_constraint_count]``.
+        """
+        ref_q = SolverMuJoCo._copy_dof_ref_to_qref(model)
+        ref_body_q = SolverMuJoCo._compute_body_poses_at_qref(model, ref_q)
+        q_rel, t_rel = SolverMuJoCo._compute_connect_constraint_rel_xform_at_qref(model, ref_body_q)
+        return q_rel, t_rel
+
+    @staticmethod
+    def _update_connect_constraint_anchors(
+        model: Model,
+        mjw_model: MjWarpModel,
+        mjc_eq_to_newton_eq: wp.array,
+        connect_anchor2_q: wp.array,
+        connect_anchor2_t: wp.array,
+    ):
+        """Write CONNECT constraint anchors into the MuJoCo Warp model.
+
+        Launches ``update_connect_constraint_anchors_kernel`` to copy
+        ``anchor1`` [m] and compute
+        ``anchor2 = quat_rotate(q_rel, anchor1) + t_rel`` [m] into
+        ``mjw_model.eq_data``. Skips immediately when ``mjw_model.neq == 0``.
+
+        Args:
+            model: The Newton :class:`Model` (source for constraint types
+                and anchor positions).
+            mjw_model: The MuJoCo Warp model (target for ``eq_data`` output).
+            mjc_eq_to_newton_eq: Mapping from MuJoCo ``[world, eq]`` to
+                Newton equality constraint index,
+                ``wp.array2d[wp.int32]``.
+            connect_anchor2_q: Precomputed relative rotation per constraint,
+                ``wp.array[wp.quat]``,
+                shape ``[equality_constraint_count]``.
+            connect_anchor2_t: Precomputed relative translation [m] per
+                constraint, ``wp.array[wp.vec3]``,
+                shape ``[equality_constraint_count]``.
+        """
+        if mjw_model.neq == 0:
+            return
+
+        world_count = mjc_eq_to_newton_eq.shape[0]
+
+        wp.launch(
+            update_connect_constraint_anchors_kernel,
+            dim=(world_count, mjw_model.neq),
+            inputs=[
+                mjc_eq_to_newton_eq,
+                model.equality_constraint_type,
+                model.equality_constraint_anchor,
+                connect_anchor2_q,
+                connect_anchor2_t,
+            ],
+            outputs=[
+                mjw_model.eq_data,
+            ],
+            device=model.device,
+        )
+
+    def _notify_connect_constraints_changed(
+        self,
+        update_anchor_rel_xform_at_ref_pose: bool,
+        update_anchors: bool,
+    ):
+        """Update CONNECT constraint anchors in response to model changes.
+
+        Optionally recomputes the relative body transforms at the reference
+        pose, then writes the resulting anchors into ``mjw_model.eq_data``
+        (and ``mj_model.eq_data`` on the CPU path).
+
+        Must be called **after** other model updates (``mj_setConst``,
+        ``set_const_0``, etc.) because it overwrites ``eq_data``.
+
+        Args:
+            update_anchor_rel_xform_at_ref_pose: Recompute ``(q_rel, t_rel)``
+                from ``dof_ref`` / joint properties.
+            update_anchors: Recompute anchors from
+                ``equality_constraint_anchor``.
+        """
+        if update_anchor_rel_xform_at_ref_pose:
+            self.connect_constraint_q_rel, self.connect_constraint_t_rel = (
+                SolverMuJoCo._update_connect_constraint_anchor_rel_xform_at_ref_pose(self.model)
+            )
+        # connect_constraint_q_rel is guaranteed non-None when update_anchors
+        # is True because _convert_to_mjc calls notify_model_changed(ALL),
+        # which includes JOINT_DOF_PROPERTIES and therefore always computes
+        # q_rel before any CONSTRAINT_PROPERTIES-only notification can occur.
+        # The None check is a defensive guard for the case where the model
+        # has no connect constraints (has_connect_constraints is False and
+        # both flags are False, so this branch is unreachable).
+        if (update_anchor_rel_xform_at_ref_pose or update_anchors) and self.connect_constraint_q_rel is not None:
+            SolverMuJoCo._update_connect_constraint_anchors(
+                self.model,
+                self.mjw_model,
+                self.mjc_eq_to_newton_eq,
+                self.connect_constraint_q_rel,
+                self.connect_constraint_t_rel,
+            )
+            if self.use_mujoco_cpu:
+                self.mj_model.eq_data[:] = self.mjw_model.eq_data.numpy()[0]
+
     def _update_geom_properties(self):
         """Update geom properties including collision radius, friction, and contact parameters in the MuJoCo model."""
 
@@ -6214,8 +6508,8 @@ class SolverMuJoCo(SolverBase):
         .. note::
 
             The MuJoCo viewer only supports rendering Newton models with a single world,
-            unless :attr:`use_mujoco_cpu` is :obj:`True` or the solver was initialized with
-            :attr:`separate_worlds` set to :obj:`False`.
+            unless ``use_mujoco_cpu`` is ``True`` or the solver was initialized with
+            ``separate_worlds`` set to ``False``.
 
             The MuJoCo viewer is only meant as a debugging tool.
 

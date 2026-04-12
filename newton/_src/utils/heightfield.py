@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -106,7 +94,7 @@ def create_empty_heightfield_data() -> HeightfieldData:
 @wp.func
 def _heightfield_surface_query(
     hfd: HeightfieldData,
-    elevation_data: wp.array(dtype=wp.float32),
+    elevation_data: wp.array[wp.float32],
     pos: wp.vec3,
 ) -> tuple[float, wp.vec3, float]:
     """Core heightfield surface query returning (plane_dist, normal, lateral_dist_sq).
@@ -165,7 +153,7 @@ def _heightfield_surface_query(
 @wp.func
 def sample_sdf_heightfield(
     hfd: HeightfieldData,
-    elevation_data: wp.array(dtype=wp.float32),
+    elevation_data: wp.array[wp.float32],
     pos: wp.vec3,
 ) -> float:
     """On-the-fly signed distance to a piecewise-planar heightfield surface.
@@ -189,7 +177,7 @@ def sample_sdf_heightfield(
 @wp.func
 def sample_sdf_grad_heightfield(
     hfd: HeightfieldData,
-    elevation_data: wp.array(dtype=wp.float32),
+    elevation_data: wp.array[wp.float32],
     pos: wp.vec3,
 ) -> tuple[float, wp.vec3]:
     """On-the-fly signed distance and gradient for a heightfield surface.
@@ -215,7 +203,7 @@ def sample_sdf_grad_heightfield(
 @wp.func
 def get_triangle_shape_from_heightfield(
     hfd: HeightfieldData,
-    elevation_data: wp.array(dtype=wp.float32),
+    elevation_data: wp.array[wp.float32],
     X_ws: wp.transform,
     tri_idx: int,
 ) -> tuple[GenericShapeData, wp.vec3]:
@@ -284,14 +272,15 @@ def get_triangle_shape_from_heightfield(
 
     # Transform to world space
     v0_world = wp.transform_point(X_ws, v0_local)
-    v1_world = wp.transform_point(X_ws, v1_local)
-    v2_world = wp.transform_point(X_ws, v2_local)
 
-    # Create triangle shape data (same convention as get_triangle_shape_from_mesh)
+    # Create triangle prism shape data with edges in heightfield-LOCAL space.
+    # The narrow phase passes orientation_a = heightfield rotation, so the
+    # support function operates in the heightfield's local frame where -Z
+    # is always the down direction — no extra arguments needed.
     shape_data = GenericShapeData()
-    shape_data.shape_type = int(GeoTypeEx.TRIANGLE)
-    shape_data.scale = v1_world - v0_world  # B - A
-    shape_data.auxiliary = v2_world - v0_world  # C - A
+    shape_data.shape_type = int(GeoTypeEx.TRIANGLE_PRISM)
+    shape_data.scale = v1_local - v0_local  # B - A in local space
+    shape_data.auxiliary = v2_local - v0_local  # C - A in local space
 
     return shape_data, v0_world
 
@@ -301,11 +290,11 @@ def heightfield_vs_convex_midphase(
     hfield_shape: int,
     other_shape: int,
     hfd: HeightfieldData,
-    shape_transform: wp.array(dtype=wp.transform),
-    shape_collision_radius: wp.array(dtype=float),
-    shape_gap: wp.array(dtype=float),
-    triangle_pairs: wp.array(dtype=wp.vec3i),
-    triangle_pairs_count: wp.array(dtype=int),
+    shape_transform: wp.array[wp.transform],
+    shape_collision_radius: wp.array[float],
+    shape_gap: wp.array[float],
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
 ):
     """Find heightfield triangles that overlap with a convex shape's bounding sphere.
 
